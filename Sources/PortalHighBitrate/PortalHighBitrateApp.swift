@@ -22,9 +22,10 @@ struct PortalHighBitrateApp: App {
     var body: some Scene {
         WindowGroup {
             PortalMainView(selectedTab: $navState.selectedTab)
-                .frame(minWidth: 960, minHeight: 660)
+                .frame(minWidth: 1200, minHeight: 822)
         }
-        .defaultSize(width: 1040, height: 740)
+        .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 1200, height: 822)
         .windowResizability(.contentSize)
         .commands {
             CommandGroup(replacing: .appInfo) {

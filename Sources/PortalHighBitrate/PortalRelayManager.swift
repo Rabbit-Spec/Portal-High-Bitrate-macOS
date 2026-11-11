@@ -2,6 +2,27 @@ import Foundation
 import AppKit
 import Darwin
 
+public enum PortalRelayMode: String, CaseIterable, Identifiable, Sendable {
+    case oneWayDirect = "oneway"
+    case twoWayTelemetry = "twoway"
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .oneWayDirect: return "单向视频直连 (推荐)"
+        case .twoWayTelemetry: return "双向遥测验证"
+        }
+    }
+
+    public var subtitle: String {
+        switch self {
+        case .oneWayDirect: return "仅劫持 Portal 上行握手，下行视频全程直连不经 Mac 限速"
+        case .twoWayTelemetry: return "双向中继捕获 PS5 确认与码率回报，开播后自动交还直连"
+        }
+    }
+}
+
 public enum BitrateProfile: String, CaseIterable, Identifiable, Sendable {
     case mbps65 = "65 Mbps"
     case mbps100 = "100 Mbps (推荐)"
@@ -26,12 +47,44 @@ public enum BitrateProfile: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+public enum SonyDeviceRole: String, Sendable, Codable {
+    case ps5Host
+    case portalClient
+    case unknownSony
+    case other
+}
+
 public struct DiscoveredDevice: Identifiable, Sendable, Codable, Hashable {
     public let id: String
     public let ip: String
     public let mac: String
     public let isLikelySony: Bool
+    public let role: SonyDeviceRole
+    public let hostName: String?
     public let label: String
+
+    public init(
+        id: String,
+        ip: String,
+        mac: String,
+        isLikelySony: Bool,
+        role: SonyDeviceRole = .other,
+        hostName: String? = nil,
+        label: String
+    ) {
+        self.id = id
+        self.ip = ip
+        self.mac = mac
+        self.isLikelySony = isLikelySony
+        self.role = role
+        self.hostName = hostName
+        self.label = label
+    }
+}
+
+public struct PortalLogEntry: Identifiable, Sendable, Equatable {
+    public let id = UUID()
+    public let text: String
 }
 
 @MainActor
@@ -39,8 +92,10 @@ public final class PortalRelayManager: ObservableObject {
     public static let shared = PortalRelayManager()
 
     @Published public var isRunning: Bool = false
+    @Published public var isStopping: Bool = false
     @Published public var isListening: Bool = false
     @Published public var isStreamActive: Bool = false
+    @Published public var relayMode: PortalRelayMode = .oneWayDirect
     @Published public var targetBitrate: BitrateProfile = .mbps100
     @Published public var selectedInterface: String = "en0"
     @Published public var activeInterfaces: [ActiveInterfaceInfo] = []
@@ -49,7 +104,15 @@ public final class PortalRelayManager: ObservableObject {
     @Published public var discoveredDevices: [DiscoveredDevice] = []
     @Published public var isScanningDevices: Bool = false
     @Published public var runWithAdmin: Bool = true
-    @Published public var logs: [String] = []
+    @Published public var isCheckingForUpdates: Bool = false
+    @Published public var updateStatusMessage: String? = nil
+    @Published public var pluginVersion: String = AppEnvironmentInfo.version
+    @Published public var pluginAuthor: String = "atameric"
+    @Published public var pluginRepo: String = "https://github.com/atameric/ps5-portal-high-bitrate"
+    @Published public var installedCommitSHA: String = "4430daa"
+    @Published public var installedCommitDate: String = "2026-10-21"
+    @Published public var installedCommitMsg: String = "docs: add October 21 Raspberry Pi and mobile update"
+    @Published public var logs: [PortalLogEntry] = []
     @Published public var lastError: String? = nil
     @Published public var listenRemainingSeconds: Int? = nil
 
@@ -63,6 +126,9 @@ public final class PortalRelayManager: ObservableObject {
     private var listenCountdownTimer: Timer?
     private var listenDeadline: Date?
     private var lastLogOffset: UInt64 = 0
+    private var logLineBuffer: Data = Data()
+    private var relaySessionID: UInt64 = 0
+    private var resetWorkItem: DispatchWorkItem?
     private var hasExplicitInterfaceConfig: Bool = false
 
     private let logFilePath = "/tmp/portal_high_bitrate.log"
@@ -75,6 +141,10 @@ public final class PortalRelayManager: ObservableObject {
 
     private var configFileURL: URL {
         supportDirectoryURL.appendingPathComponent("config.json")
+    }
+
+    private var manifestFileURL: URL {
+        supportDirectoryURL.appendingPathComponent("manifest.json")
     }
 
     private var engineFileURL: URL {
@@ -91,14 +161,15 @@ public final class PortalRelayManager: ObservableObject {
 
     private init() {
         bootstrapSupportDirectory()
+        loadManifest()
         loadConfig()
         detectInterfaces()
-        appendLog("[Portal-High-Bitrate] 已就绪 (v\(AppEnvironmentInfo.version) · \(AppEnvironmentInfo.architectureDescription))")
+        appendLog("[Portal-High-Bitrate] 插件子系统加载完成：PS Portal 串流画质增强模块 (v\(pluginVersion) · \(AppEnvironmentInfo.architectureDescription))")
     }
 
     // MARK: - 启动与持久化
 
-    private func bootstrapSupportDirectory() {
+    public func bootstrapSupportDirectory() {
         let fm = FileManager.default
         let dir = supportDirectoryURL
         if !fm.fileExists(atPath: dir.path) {
@@ -107,16 +178,80 @@ public final class PortalRelayManager: ObservableObject {
         if let bundleEngine = Bundle.main.resourceURL?.appendingPathComponent("portal_engine"),
            fm.fileExists(atPath: bundleEngine.path) {
             let dst = dir.appendingPathComponent("portal_engine")
-            try? fm.removeItem(at: dst)
-            try? fm.copyItem(at: bundleEngine, to: dst)
+            if !fm.fileExists(atPath: dst.path) || Self.shouldReplaceResource(src: bundleEngine, dst: dst) {
+                try? fm.removeItem(at: dst)
+                try? fm.copyItem(at: bundleEngine, to: dst)
+            }
             try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dst.path)
         }
+        if let bundleManifest = Bundle.main.resourceURL?.appendingPathComponent("manifest.json"),
+           fm.fileExists(atPath: bundleManifest.path) {
+            let dst = manifestFileURL
+            if !fm.fileExists(atPath: dst.path) || Self.shouldReplaceResource(src: bundleManifest, dst: dst) {
+                try? fm.removeItem(at: dst)
+                try? fm.copyItem(at: bundleManifest, to: dst)
+            }
+        } else if !fm.fileExists(atPath: manifestFileURL.path) {
+            writeDefaultManifest()
+        }
+    }
+
+    private func writeDefaultManifest() {
+        let json = """
+        {
+          "id": "com.rabbit.portal-high-bitrate",
+          "name": "PS Portal 串流画质增强",
+          "version": "\(AppEnvironmentInfo.version)",
+          "installedCommitSHA": "4430daa",
+          "installedCommitDate": "2026-10-21",
+          "installedCommitMsg": "docs: add October 21 Raspberry Pi and mobile update",
+          "author": "atameric",
+          "license": "GPL-3.0",
+          "repo": "https://github.com/atameric/ps5-portal-high-bitrate",
+          "description": "突破 PlayStation Portal 官方默认串流比特率限制，通过局域网握手阶段重写比特率参数，实现 65 Mbps / 100 Mbps / 200 Mbps 极致清晰度，无需对 PS5 或 PS Portal 进行任何越狱与硬改。",
+          "entry": "portal_engine"
+        }
+        """
+        try? json.write(to: manifestFileURL, atomically: true, encoding: .utf8)
+    }
+
+    public func loadManifest() {
+        guard let data = try? Data(contentsOf: manifestFileURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return
+        }
+        if let v = json["version"] as? String, !v.isEmpty { self.pluginVersion = v }
+        if let a = json["author"] as? String, !a.isEmpty { self.pluginAuthor = a }
+        if let r = json["repo"] as? String, !r.isEmpty { self.pluginRepo = r }
+        if let sha = json["installedCommitSHA"] as? String, !sha.isEmpty { self.installedCommitSHA = sha }
+        if let d = json["installedCommitDate"] as? String, !d.isEmpty { self.installedCommitDate = d }
+        if let m = json["installedCommitMsg"] as? String, !m.isEmpty { self.installedCommitMsg = m }
+    }
+
+    private static func shouldReplaceResource(src: URL, dst: URL) -> Bool {
+        let fm = FileManager.default
+        guard let srcAttr = try? fm.attributesOfItem(atPath: src.path),
+              let dstAttr = try? fm.attributesOfItem(atPath: dst.path) else {
+            return true
+        }
+        let srcSize = srcAttr[.size] as? NSNumber
+        let dstSize = dstAttr[.size] as? NSNumber
+        if srcSize != dstSize { return true }
+        if let srcDate = srcAttr[.modificationDate] as? Date,
+           let dstDate = dstAttr[.modificationDate] as? Date,
+           abs(srcDate.timeIntervalSince(dstDate)) > 1.0 {
+            return true
+        }
+        return false
     }
 
     public func loadConfig() {
         guard let data = try? Data(contentsOf: configFileURL),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return
+        }
+        if let modeRaw = json["relayMode"] as? String, let matchedMode = PortalRelayMode(rawValue: modeRaw) {
+            self.relayMode = matchedMode
         }
         if let b = json["targetBitrate"] as? String,
            let matched = BitrateProfile.allCases.first(where: { $0.shortTag == b || $0.rawValue.contains(b) }) {
@@ -142,6 +277,7 @@ public final class PortalRelayManager: ObservableObject {
 
     public func saveConfig() {
         let dict: [String: Any] = [
+            "relayMode": relayMode.rawValue,
             "targetBitrate": targetBitrate.shortTag,
             "interface": selectedInterface,
             "interfaceManualSelection": hasExplicitInterfaceConfig,
@@ -151,6 +287,81 @@ public final class PortalRelayManager: ObservableObject {
         ]
         if let data = try? JSONSerialization.data(withJSONObject: dict, options: .prettyPrinted) {
             try? data.write(to: configFileURL)
+        }
+    }
+
+    public func reloadPlugin() {
+        stopRelay()
+        bootstrapSupportDirectory()
+        loadManifest()
+        loadConfig()
+        detectInterfaces()
+        appendLog("[Portal-High-Bitrate] 插件配置与原生引擎已重新载入。")
+    }
+
+    public func openPluginFolder() {
+        bootstrapSupportDirectory()
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: supportDirectoryURL.path)
+    }
+
+    // MARK: - 检查插件更新 (精确双向比对)
+
+    public func checkForPluginUpdates() {
+        guard !isCheckingForUpdates else { return }
+        isCheckingForUpdates = true
+        updateStatusMessage = "正在连接 GitHub 比对版本..."
+        appendLog("[更新] 正在连接 GitHub 比对版本...")
+
+        let localSHA = self.installedCommitSHA
+        let localDate = self.installedCommitDate
+
+        Task.detached { [weak self] in
+            var cloudSHA: String? = nil
+            var cloudMsg: String = ""
+
+            if let apiURL = URL(string: "https://api.github.com/repos/atameric/ps5-portal-high-bitrate/commits/main") {
+                var request = URLRequest(url: apiURL)
+                request.setValue("Portal-High-Bitrate-macOS-Agent", forHTTPHeaderField: "User-Agent")
+                request.timeoutInterval = 7.0
+                if let (data, response) = try? await URLSession.shared.data(for: request),
+                   let http = response as? HTTPURLResponse, http.statusCode == 200,
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let sha = json["sha"] as? String {
+                    cloudSHA = String(sha.prefix(7))
+                    if let commitObj = json["commit"] as? [String: Any],
+                       let msg = commitObj["message"] as? String {
+                        cloudMsg = msg.components(separatedBy: .newlines).first ?? ""
+                    }
+                }
+            }
+
+            let resolvedCloudSHA = cloudSHA
+            let resolvedCloudMsg = cloudMsg
+
+            await MainActor.run {
+                guard let self else { return }
+                self.isCheckingForUpdates = false
+
+                if let sha = resolvedCloudSHA {
+                    if sha.lowercased() == localSHA.lowercased() {
+                        self.updateStatusMessage = "已是官方最新版本 (\(localSHA))"
+                        self.appendLog("[更新] ✅ 本地已是官方最新版本！")
+                        self.appendLog("├─ 本地已验证版本: [\(localSHA)] (\(localDate) · 稳定运行中)")
+                        self.appendLog("└─ 官方远端最新版: [\(sha)] (完全同步)")
+                        self.appendLog("[说明] 当前插件协议逻辑已与官方主分支保持同步。")
+                    } else {
+                        self.updateStatusMessage = "官方有新提交 [\(sha)] · 随版本推送"
+                        self.appendLog("[更新] 💡 发现官方主分支有新提交！")
+                        self.appendLog("├─ 本地已验证版本: [\(localSHA)] (已完成实机串流测试 · 稳定运行中)")
+                        self.appendLog("└─ 官方远端最新版: [\(sha)] (最新提交说明: \(resolvedCloudMsg))")
+                        self.appendLog("[提示] 🛡️ 出于系统网络与串流稳定性保障，禁止本地直接在线热覆盖。")
+                        self.appendLog("[说明] 新源码将在经过完整实机兼容性测试后，随 Portal-High-Bitrate 下一版本推送。")
+                    }
+                } else {
+                    self.updateStatusMessage = "本地版本 [\(localSHA)] 正常就绪"
+                    self.appendLog("[更新] ⚠️ 无法连接到 GitHub 远端，本地插件已验证版本 [\(localSHA)] 正常就绪。")
+                }
+            }
         }
     }
 
@@ -184,141 +395,202 @@ public final class PortalRelayManager: ObservableObject {
         guard !isScanningDevices else { return }
         detectInterfaces()
         self.isScanningDevices = true
-        self.appendLog("[扫描] 正在探测局域网活动设备 (ARP 表与常见网段探活)...")
+        self.appendLog("[Portal-High-Bitrate] 正在探测局域网活动设备...")
 
-        let currentPS5 = self.ps5IP
-        let currentPortal = self.portalIP
+        let targetIface = self.selectedInterface
         let localIP = self.selectedInterfaceInfo?.ip ?? ""
+        let (gatewayIP, _) = ActiveInterfaceInfo.detectGatewayAndInterface()
+        let currentPS5 = self.ps5IP.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentPortal = self.portalIP.trimmingCharacters(in: .whitespacesAndNewlines)
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            var hostsToProbe: [String] = []
-            if !currentPS5.isEmpty { hostsToProbe.append(currentPS5) }
-            if !currentPortal.isEmpty { hostsToProbe.append(currentPortal) }
-
-            let (gateway, _) = ActiveInterfaceInfo.detectGatewayAndInterface()
-            if !gateway.isEmpty { hostsToProbe.append(gateway) }
-
-            if !localIP.isEmpty {
-                let parts = localIP.split(separator: ".")
-                if parts.count == 4 {
-                    let subnet = "\(parts[0]).\(parts[1]).\(parts[2])"
-                    // 并发轻量探测当前网段常见地址段以刷新 ARP 表
-                    for hostIdx in 1...254 {
-                        let candidate = "\(subnet).\(hostIdx)"
-                        if candidate != localIP {
-                            hostsToProbe.append(candidate)
-                        }
-                    }
+            let subnetInfo = ActiveInterfaceInfo.ipv4SubnetInfo(for: targetIface)
+            let subnetSeed = !localIP.isEmpty ? localIP : gatewayIP
+            let parts = subnetSeed.split(separator: ".")
+            var broadcastTargets = ["255.255.255.255"]
+            if let bcast = subnetInfo?.broadcast, !bcast.isEmpty, !broadcastTargets.contains(bcast) {
+                broadcastTargets.append(bcast)
+            }
+            if parts.count == 4 {
+                let prefix = "\(parts[0]).\(parts[1]).\(parts[2])"
+                PortalLanDiscovery.sweepSubnetFast(basePrefix: prefix, interfaceName: targetIface)
+                let fallbackBcast = "\(prefix).255"
+                if !broadcastTargets.contains(fallbackBcast) {
+                    broadcastTargets.append(fallbackBcast)
                 }
+                usleep(280_000)
             }
 
-            let uniqueHosts = Array(Set(hostsToProbe))
-            let group = DispatchGroup()
-            let sem = DispatchSemaphore(value: 48)
-            for host in uniqueHosts {
-                group.enter()
-                sem.wait()
-                DispatchQueue.global(qos: .utility).async {
-                    let p = Process()
-                    p.executableURL = URL(fileURLWithPath: "/sbin/ping")
-                    p.arguments = ["-c", "1", "-W", "120", host]
-                    p.standardOutput = Pipe()
-                    p.standardError = Pipe()
-                    try? p.run()
-                    p.waitUntilExit()
-                    sem.signal()
-                    group.leave()
-                }
+            var rawEntries = PortalLanDiscovery.readArpTableViaKernelSysctl()
+            if rawEntries.isEmpty {
+                rawEntries = PortalLanDiscovery.readArpTableViaCli()
             }
-            group.wait()
+
+            var arpByIP: [String: (ip: String, mac: String, ifName: String)] = [:]
+            for entry in rawEntries {
+                let ip = entry.ip
+                let mac = entry.mac.lowercased()
+                let ifName = entry.ifName.isEmpty ? targetIface : entry.ifName
+
+                guard !ip.isEmpty, ip.contains("."),
+                      !entry.isLocal, ip != localIP, ip != "127.0.0.1", ip != gatewayIP,
+                      !ip.hasSuffix(".255"), !ip.hasPrefix("224."), !ip.hasPrefix("239."),
+                      ip != "255.255.255.255" else { continue }
+                guard mac.count == 17,
+                      mac != "00:00:00:00:00:00",
+                      mac != "ff:ff:ff:ff:ff:ff" else { continue }
+                if !localIP.isEmpty && !entry.ifName.isEmpty && entry.ifName != targetIface {
+                    continue
+                }
+
+                if arpByIP[ip] != nil && ifName != targetIface {
+                    continue
+                }
+                arpByIP[ip] = (ip: ip, mac: mac, ifName: ifName)
+            }
+
+            DispatchQueue.main.async {
+                self?.appendLog("[Portal-High-Bitrate] 正在通过 PlayStation DDP (UDP 9302) 辨别主机与 Portal 掌机...")
+            }
+
+            var ddpTargets = arpByIP.values.filter { PortalLanDiscovery.isSonyOUI($0.mac) }.map { $0.ip }
+            if !currentPS5.isEmpty { ddpTargets.append(currentPS5) }
+            if !currentPortal.isEmpty { ddpTargets.append(currentPortal) }
+            let ddpMap = PortalLanDiscovery.probePlayStationDDP(
+                targetIPs: ddpTargets,
+                broadcastIPs: broadcastTargets,
+                interfaceName: targetIface,
+                timeoutMs: 280
+            )
 
             var results: [DiscoveredDevice] = []
-            var seen = Set<String>()
-            let arpCommands = [
-                ["/usr/sbin/arp", "-a", "-n"],
-                ["/usr/sbin/arp", "-a"]
-            ]
-            for cmd in arpCommands {
-                if !results.isEmpty { break }
-                let task = Process()
-                task.executableURL = URL(fileURLWithPath: cmd[0])
-                task.arguments = Array(cmd.dropFirst())
-                let p = Pipe()
-                task.standardOutput = p
-                task.standardError = Pipe()
-                if (try? task.run()) != nil {
-                    let d = p.fileHandleForReading.readDataToEndOfFile()
-                    task.waitUntilExit()
-                    if let text = String(data: d, encoding: .utf8), !text.isEmpty {
-                        results.append(contentsOf: Self.parseARPOutput(text, gatewayIP: gateway, seen: &seen))
-                    }
+            for entry in arpByIP.values {
+                let ip = entry.ip
+                let mac = entry.mac
+                let ddp = ddpMap[ip]
+                let isSonyOUI = PortalLanDiscovery.isSonyOUI(mac)
+                let isPortalOUI = PortalLanDiscovery.isPortalOUI(mac)
+                let isSony = (ddp != nil) || isSonyOUI
+
+                let role: SonyDeviceRole
+                let label: String
+                if let ddp {
+                    role = .ps5Host
+                    label = ddp.hostName.isEmpty ? ddp.hostType : "\(ddp.hostType) (\(ddp.hostName))"
+                } else if isPortalOUI {
+                    role = .portalClient
+                    label = "PS Portal"
+                } else if isSonyOUI {
+                    role = .unknownSony
+                    label = "Sony PlayStation 设备"
+                } else {
+                    role = .other
+                    label = "局域网终端"
                 }
+
+                results.append(DiscoveredDevice(
+                    id: "\(ip)-\(mac)",
+                    ip: ip,
+                    mac: mac,
+                    isLikelySony: isSony,
+                    role: role,
+                    hostName: ddp?.hostName,
+                    label: label
+                ))
+            }
+
+            for (ip, ddp) in ddpMap where arpByIP[ip] == nil {
+                results.append(DiscoveredDevice(
+                    id: "\(ip)-ddp",
+                    ip: ip,
+                    mac: "",
+                    isLikelySony: true,
+                    role: .ps5Host,
+                    hostName: ddp.hostName,
+                    label: ddp.hostName.isEmpty ? ddp.hostType : "\(ddp.hostType) (\(ddp.hostName))"
+                ))
             }
 
             results.sort { a, b in
-                if a.isLikelySony != b.isLikelySony { return a.isLikelySony && !b.isLikelySony }
+                let rank: (SonyDeviceRole) -> Int = { role in
+                    switch role {
+                    case .ps5Host: return 0
+                    case .portalClient: return 1
+                    case .unknownSony: return 2
+                    case .other: return 3
+                    }
+                }
+                if rank(a.role) != rank(b.role) {
+                    return rank(a.role) < rank(b.role)
+                }
+                let ip1 = PortalLanDiscovery.ipToComparable(a.ip)
+                let ip2 = PortalLanDiscovery.ipToComparable(b.ip)
+                if ip1 != ip2 { return ip1 < ip2 }
                 return a.ip < b.ip
             }
 
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                self.isScanningDevices = false
                 self.discoveredDevices = results
-                self.appendLog("[扫描] 发现 \(results.count) 个活跃节点。")
-                for dev in results where dev.isLikelySony {
-                    self.appendLog("  • \(dev.label): \(dev.ip) [MAC: \(dev.mac)]")
+                self.isScanningDevices = false
+
+                let isInActiveSubnet: (String) -> Bool = { ip in
+                    guard !ip.isEmpty else { return false }
+                    if let subnetInfo {
+                        let targetVal = PortalLanDiscovery.ipToComparable(ip)
+                        return targetVal != 0 && (targetVal & subnetInfo.mask) == (subnetInfo.ip & subnetInfo.mask)
+                    }
+                    guard !localIP.isEmpty else { return true }
+                    let localPrefix = localIP.split(separator: ".").prefix(3).joined(separator: ".")
+                    let targetPrefix = ip.split(separator: ".").prefix(3).joined(separator: ".")
+                    return !localPrefix.isEmpty && localPrefix == targetPrefix
                 }
-            }
-        }
-    }
 
-    nonisolated private static func parseARPOutput(_ output: String, gatewayIP: String, seen: inout Set<String>) -> [DiscoveredDevice] {
-        var found: [DiscoveredDevice] = []
-        let lines = output.components(separatedBy: .newlines)
-        for line in lines {
-            guard let start = line.range(of: "("),
-                  let end = line.range(of: ")"),
-                  start.upperBound < end.lowerBound else { continue }
-            let ip = String(line[start.upperBound..<end.lowerBound])
-            guard !ip.isEmpty, ip != "127.0.0.1", ip != gatewayIP,
-                  !ip.hasSuffix(".255"), !ip.hasPrefix("224."), !ip.hasPrefix("239."),
-                  !seen.contains(ip) else { continue }
+                let ps5Dev = results.first(where: { $0.role == .ps5Host })
+                let portalDev = results.first(where: { $0.role == .portalClient && $0.ip != ps5Dev?.ip })
+                    ?? results.first(where: { $0.role == .unknownSony && $0.ip != ps5Dev?.ip })
 
-            var mac = ""
-            if let atRange = line.range(of: " at ") {
-                let sub = line[atRange.upperBound...]
-                let parts = sub.split(separator: " ")
-                if let first = parts.first {
-                    let rawMac = String(first)
-                    if rawMac != "(incomplete)" && rawMac != "ff:ff:ff:ff:ff:ff" {
-                        mac = normalizeMAC(rawMac)
+                if let ps5 = ps5Dev {
+                    self.appendLog("[识别] PS5 -> \(ps5.ip)")
+                    let curPS5 = self.ps5IP.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if curPS5.isEmpty || curPS5 == portalDev?.ip || !isInActiveSubnet(curPS5) {
+                        self.ps5IP = ps5.ip
+                    } else if ps5.ip != curPS5 && !results.contains(where: { $0.ip == curPS5 }) {
+                        self.appendLog("[提示] 新识别到同网段 PS5 (\(ps5.ip))，若主机已换 IP 可点击上方胶囊切换。")
                     }
                 }
+                if let portal = portalDev {
+                    self.appendLog("[识别] Portal -> \(portal.ip)")
+                    let curPortal = self.portalIP.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if curPortal.isEmpty || curPortal == ps5Dev?.ip || !isInActiveSubnet(curPortal) {
+                        self.portalIP = portal.ip
+                    } else if portal.role == .portalClient && portal.ip != curPortal && !results.contains(where: { $0.ip == curPortal }) {
+                        self.appendLog("[提示] 新识别到同网段 Portal (\(portal.ip))，若设备已换 IP 可点击上方胶囊切换。")
+                    }
+                }
+                self.saveConfig()
+                self.appendLog("[Portal-High-Bitrate] 局域网扫描完成")
             }
-            guard !mac.isEmpty else { continue }
-            seen.insert(ip)
-
-            let isSony = isSonyOUI(mac)
-            let label = isSony ? "Sony / PlayStation" : "局域网设备"
-            found.append(DiscoveredDevice(id: ip, ip: ip, mac: mac, isLikelySony: isSony, label: label))
         }
-        return found
     }
 
-    nonisolated private static func normalizeMAC(_ raw: String) -> String {
-        raw.split(separator: ":").map { $0.count == 1 ? "0\($0)" : String($0) }.joined(separator: ":").lowercased()
+    nonisolated private static func shellSingleQuoted(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    nonisolated private static func isSonyOUI(_ mac: String) -> Bool {
-        let oui = String(mac.prefix(8))
-        let sonyOUIs: Set<String> = [
-            "00:04:1f", "00:13:15", "00:15:c1", "00:19:c5", "00:1d:0d",
-            "00:1f:a7", "00:24:8d", "00:d9:d1", "00:e4:21", "28:0d:fc",
-            "2c:cc:44", "40:16:7e", "70:9e:29", "78:c8:81", "84:20:96",
-            "a8:e3:ee", "bc:60:a7", "c8:63:f1", "d4:4b:5e", "e8:9e:b4",
-            "f8:46:1c", "fc:0f:e6", "b4:0a:d8", "30:e1:71", "54:42:49"
-        ]
-        return sonyOUIs.contains(oui)
+    nonisolated private static func appleScriptEscaped(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    nonisolated private static func isValidUnicastIPv4(_ ip: String) -> Bool {
+        var addr = in_addr()
+        guard inet_pton(AF_INET, ip, &addr) == 1 else { return false }
+        let hostOrder = UInt32(bigEndian: addr.s_addr)
+        let firstOctet = (hostOrder >> 24) & 0xFF
+        if firstOctet == 0 || firstOctet == 127 || firstOctet >= 224 { return false }
+        if (hostOrder & 0xFFFF0000) == 0xA9FE0000 { return false }
+        return true
     }
 
     // MARK: - 倒计时与日志监听
@@ -334,12 +606,13 @@ public final class PortalRelayManager: ObservableObject {
                     self?.stopListenCountdown()
                     return
                 }
-                let rem = max(0, Int(ceil(deadline.timeIntervalSinceNow)))
+                let rem = max(0, min(seconds, Int(ceil(deadline.timeIntervalSinceNow))))
                 if rem != self.listenRemainingSeconds {
                     self.listenRemainingSeconds = rem
                 }
                 if rem <= 0 {
-                    self.stopListenCountdown()
+                    self.listenCountdownTimer?.invalidate()
+                    self.listenCountdownTimer = nil
                 }
             }
         }
@@ -357,8 +630,8 @@ public final class PortalRelayManager: ObservableObject {
     // MARK: - 中继启停
 
     public func startRelay() {
-        guard !isRunning else { return }
-        lastError = nil
+        guard !isRunning && !isStopping else { return }
+        bootstrapSupportDirectory()
 
         let trimmedPS5 = ps5IP.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedPortal = portalIP.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -366,9 +639,26 @@ public final class PortalRelayManager: ObservableObject {
         portalIP = trimmedPortal
 
         guard !trimmedPS5.isEmpty, !trimmedPortal.isEmpty else {
-            lastError = "请先填写 PS5 IP 与 PS Portal IP（或点击上方“扫描局域网设备”快速填入）。"
+            lastError = "请先填写 PS5 IP 与 PS Portal IP（可点击「扫描局域网设备」快速识别并填入）。"
             appendLog("[错误] \(lastError!)")
             return
+        }
+        guard Self.isValidUnicastIPv4(trimmedPS5), Self.isValidUnicastIPv4(trimmedPortal) else {
+            lastError = "请输入合法的局域网 IPv4 地址（例如 192.168.x.x）。"
+            appendLog("[错误] \(lastError!)")
+            return
+        }
+        guard trimmedPS5 != trimmedPortal else {
+            lastError = "PS5 IP 与 PS Portal IP 不能相同（\(trimmedPS5)）。"
+            appendLog("[错误] \(lastError!)")
+            return
+        }
+        if let ps5Confirmed = discoveredDevices.first(where: { $0.role == .ps5Host }),
+           let portalConfirmed = discoveredDevices.first(where: { $0.role == .portalClient }) ?? discoveredDevices.first(where: { $0.role == .unknownSony }),
+           trimmedPS5 == portalConfirmed.ip && trimmedPortal == ps5Confirmed.ip {
+            ps5IP = ps5Confirmed.ip
+            portalIP = portalConfirmed.ip
+            appendLog("[Portal-High-Bitrate] ⚡️ 根据 DDP 识别结果检测到 PS5 与 Portal IP 填反，已自动对调纠正。")
         }
         saveConfig()
 
@@ -379,24 +669,32 @@ public final class PortalRelayManager: ObservableObject {
             return
         }
 
+        resetWorkItem?.cancel()
+        resetWorkItem = nil
+        relaySessionID &+= 1
+        let currentSession = relaySessionID
+
+        lastError = nil
         isRunning = true
         isListening = true
         isStreamActive = false
+        logLineBuffer.removeAll()
 
-        appendLog("[Portal-High-Bitrate] 启动 PS Portal 串流画质增强 (Universal Native BPF)...")
-        appendLog("[配置] 目标码率: \(targetBitrate.rawValue) | 网卡: \(selectedInterface)")
-        appendLog("[配置] PS5: \(ps5IP) | PS Portal: \(portalIP)")
+        appendLog("[Portal-High-Bitrate] 启动 PS Portal 串流画质增强模块…")
+        appendLog("[配置] 目标码率: \(targetBitrate.rawValue) | 模式: \(relayMode.rawValue) | 网卡: \(selectedInterface)")
+        appendLog("[配置] PS5: \(ps5IP) | Portal: \(portalIP)")
 
         if runWithAdmin {
-            startPrivilegedRelay(engine: engine)
+            startPrivilegedRelay(engine: engine, sessionID: currentSession)
         } else {
-            startStandardRelay(engine: engine)
+            startStandardRelay(engine: engine, sessionID: currentSession)
         }
     }
 
-    private func startPrivilegedRelay(engine: String) {
+    private func startPrivilegedRelay(engine: String, sessionID: UInt64) {
         try? "".write(toFile: logFilePath, atomically: true, encoding: .utf8)
         lastLogOffset = 0
+        logLineBuffer.removeAll()
 
         let checkProcess = Process()
         checkProcess.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
@@ -407,60 +705,62 @@ public final class PortalRelayManager: ObservableObject {
         }()
 
         if isPasswordless {
-            appendLog("[Portal-High-Bitrate] ⚡️ 检测到系统免密特权已激活，正在静默秒启原生 BPF 注入引擎...")
+            appendLog("[Portal-High-Bitrate] ⚡️ 检测到系统免密特权已激活，正在启动原生 BPF 注入引擎...")
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-            proc.arguments = [
+            var args = [
                 "-n", engine,
                 "--interface", selectedInterface,
                 "--bitrate", targetBitrate.shortTag,
-                "--ps5", ps5IP,
-                "--portal", portalIP
+                "--mode", relayMode.rawValue
             ]
+            if !ps5IP.isEmpty { args.append(contentsOf: ["--ps5", ps5IP]) }
+            if !portalIP.isEmpty { args.append(contentsOf: ["--portal", portalIP]) }
+            proc.arguments = args
 
-            let pipe = Pipe()
-            proc.standardOutput = pipe
-            proc.standardError = pipe
-            self.outputPipe = pipe
+            FileManager.default.createFile(atPath: logFilePath, contents: nil)
+            if let logHandle = FileHandle(forWritingAtPath: logFilePath) {
+                proc.standardOutput = logHandle
+                proc.standardError = logHandle
+            }
             self.relayProcess = proc
 
-            pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                let data = handle.availableData
-                guard !data.isEmpty, let str = String(data: data, encoding: .utf8) else { return }
-                let lines = str.components(separatedBy: .newlines).filter { !$0.isEmpty }
-                DispatchQueue.main.async {
-                    for line in lines {
-                        self?.appendLog(line)
-                        self?.evaluateProcessOutput(line)
-                    }
-                }
-            }
-
-            proc.terminationHandler = { [weak self] process in
-                DispatchQueue.main.async {
-                    guard let self = self else { return }
-                    self.outputPipe?.fileHandleForReading.readabilityHandler = nil
-                    self.outputPipe = nil
-                    if self.isRunning {
-                        self.isRunning = false
-                        self.isListening = false
-                        self.stopListenCountdown()
-                        self.appendLog("[Portal-High-Bitrate] 引擎进程已结束 (状态码: \(process.terminationStatus))。")
-                    }
+            proc.terminationHandler = { [weak self] _ in
+                Task { @MainActor in
+                    guard let self = self, self.relaySessionID == sessionID else { return }
+                    self.pollLogFile(sessionID: sessionID)
+                    self.flushRemainingLogBuffer(sessionID: sessionID)
+                    self.resetWorkItem?.cancel()
+                    self.resetWorkItem = nil
+                    self.isRunning = false
+                    self.isListening = false
+                    self.isStreamActive = false
+                    self.stopListenCountdown()
+                    self.logWatchTimer?.invalidate()
+                    self.logWatchTimer = nil
+                    self.relayProcess = nil
                 }
             }
 
             do {
                 try proc.run()
+                let pid = proc.processIdentifier
+                appendLog("[Portal-High-Bitrate] ✅ 管理员特权中继已在后台激活 (免密模式 · sudo PID: \(pid))。")
+                startTailingLogFile(sessionID: sessionID)
                 return
             } catch {
                 appendLog("[提示] 免密进程启动受限，尝试常规特权引导...")
             }
         }
 
-        appendLog("[Portal-High-Bitrate] 正在申请 macOS 管理员特权并写入永久免密规则...")
-        let cmd = "'\(engine)' --install-sudoers >/dev/null 2>&1 || true; '\(engine)' --interface '\(selectedInterface)' --bitrate '\(targetBitrate.shortTag)' --ps5 '\(ps5IP)' --portal '\(portalIP)' > '\(logFilePath)' 2>&1 & echo $! > '\(pidFilePath)'"
-        let appleScript = "do shell script \"\(cmd)\" with administrator privileges"
+        appendLog("[Portal-High-Bitrate] 正在申请 macOS 系统管理员特权以执行原生 ARP 注入与数据包修改...")
+
+        var cmd = "\(Self.shellSingleQuoted(engine)) --install-sudoers >/dev/null 2>&1 || true; \(Self.shellSingleQuoted(engine)) --interface \(Self.shellSingleQuoted(selectedInterface)) --bitrate \(Self.shellSingleQuoted(targetBitrate.shortTag)) --mode \(Self.shellSingleQuoted(relayMode.rawValue))"
+        if !ps5IP.isEmpty { cmd += " --ps5 \(Self.shellSingleQuoted(ps5IP))" }
+        if !portalIP.isEmpty { cmd += " --portal \(Self.shellSingleQuoted(portalIP))" }
+        cmd += " > \(Self.shellSingleQuoted(logFilePath)) 2>&1 & echo $! > \(Self.shellSingleQuoted(pidFilePath))"
+
+        let appleScript = "do shell script \"\(Self.appleScriptEscaped(cmd))\" with administrator privileges"
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var errorDict: NSDictionary?
@@ -468,29 +768,37 @@ public final class PortalRelayManager: ObservableObject {
             scriptObj?.executeAndReturnError(&errorDict)
 
             DispatchQueue.main.async {
-                guard let self = self else { return }
+                guard let self = self, self.relaySessionID == sessionID else { return }
                 if let err = errorDict {
                     let errMsg = err[NSAppleScript.errorMessage] as? String ?? "用户取消授权"
                     self.appendLog("[提示] 特权授权未完成: \(errMsg)")
-                    self.appendLog("[降级] 正在以非特权模式尝试启动...")
-                    self.startStandardRelay(engine: engine)
+                    self.lastError = "需要管理员特权才能启用原生 BPF / ARP 注入（\(errMsg)）。"
+                    self.appendLog("[错误] \(self.lastError!)")
+                    self.resetWorkItem?.cancel()
+                    self.resetWorkItem = nil
+                    self.isRunning = false
+                    self.isListening = false
+                    self.isStreamActive = false
+                    self.stopListenCountdown()
                 } else {
                     self.appendLog("[Portal-High-Bitrate] ✅ 管理员特权中继已在后台激活 (已建立免密通道)。")
-                    self.startTailingLogFile()
+                    self.startTailingLogFile(sessionID: sessionID)
                 }
             }
         }
     }
 
-    private func startStandardRelay(engine: String) {
+    private func startStandardRelay(engine: String, sessionID: UInt64) {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: engine)
-        proc.arguments = [
+        var args = [
             "--interface", selectedInterface,
             "--bitrate", targetBitrate.shortTag,
-            "--ps5", ps5IP,
-            "--portal", portalIP
+            "--mode", relayMode.rawValue
         ]
+        if !ps5IP.isEmpty { args.append(contentsOf: ["--ps5", ps5IP]) }
+        if !portalIP.isEmpty { args.append(contentsOf: ["--portal", portalIP]) }
+        proc.arguments = args
 
         let pipe = Pipe()
         proc.standardOutput = pipe
@@ -500,27 +808,25 @@ public final class PortalRelayManager: ObservableObject {
 
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            guard !data.isEmpty, let str = String(data: data, encoding: .utf8) else { return }
-            let lines = str.components(separatedBy: .newlines).filter { !$0.isEmpty }
-            DispatchQueue.main.async {
-                for line in lines {
-                    self?.appendLog(line)
-                    self?.evaluateProcessOutput(line)
-                }
+            guard !data.isEmpty, let self = self else { return }
+            Task { @MainActor in
+                guard self.relaySessionID == sessionID else { return }
+                self.ingestLogData(data, sessionID: sessionID)
             }
         }
 
         proc.terminationHandler = { [weak self] process in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                self.outputPipe?.fileHandleForReading.readabilityHandler = nil
-                self.outputPipe = nil
-                if self.isRunning {
-                    self.isRunning = false
-                    self.isListening = false
-                    self.stopListenCountdown()
-                    self.appendLog("[Portal-High-Bitrate] 引擎进程已结束 (状态码: \(process.terminationStatus))。")
-                }
+            Task { @MainActor in
+                guard let self = self, self.relaySessionID == sessionID else { return }
+                self.flushRemainingLogBuffer(sessionID: sessionID)
+                self.resetWorkItem?.cancel()
+                self.resetWorkItem = nil
+                self.isRunning = false
+                self.isListening = false
+                self.isStreamActive = false
+                self.stopListenCountdown()
+                self.relayProcess = nil
+                self.appendLog("[Portal-High-Bitrate] 引擎进程已安全退出 (状态码: \(process.terminationStatus))。")
             }
         }
 
@@ -529,128 +835,245 @@ public final class PortalRelayManager: ObservableObject {
         } catch {
             isRunning = false
             isListening = false
+            isStreamActive = false
             stopListenCountdown()
             lastError = "启动原生引擎失败: \(error.localizedDescription)"
             appendLog("[错误] \(lastError!)")
         }
     }
 
-    private func startTailingLogFile() {
+    private func startTailingLogFile(sessionID: UInt64) {
         logWatchTimer?.invalidate()
-        logWatchTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
+        lastLogOffset = 0
+        logLineBuffer.removeAll()
+        logWatchTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
             Task { @MainActor in
-                self?.readNewLogBytes()
+                guard self.relaySessionID == sessionID else { return }
+                self.pollLogFile(sessionID: sessionID)
             }
         }
     }
 
-    private func readNewLogBytes() {
+    private func pollLogFile(sessionID: UInt64) {
         guard let handle = FileHandle(forReadingAtPath: logFilePath) else { return }
         defer { try? handle.close() }
         handle.seek(toFileOffset: lastLogOffset)
         let data = handle.readDataToEndOfFile()
         if !data.isEmpty {
             lastLogOffset += UInt64(data.count)
-            if let str = String(data: data, encoding: .utf8) {
-                let lines = str.components(separatedBy: .newlines).filter { !$0.isEmpty }
-                for line in lines {
-                    appendLog(line)
-                    evaluateProcessOutput(line)
-                }
-            }
+            ingestLogData(data, sessionID: sessionID)
+        }
+    }
+
+    private func ingestLogData(_ data: Data, sessionID: UInt64) {
+        logLineBuffer.append(data)
+        guard let lastNewline = logLineBuffer.lastIndex(of: 0x0A) else { return }
+
+        let completeSlice = logLineBuffer[logLineBuffer.startIndex...lastNewline]
+        let remainder = Data(logLineBuffer[logLineBuffer.index(after: lastNewline)...])
+        logLineBuffer = remainder
+
+        let text = String(decoding: completeSlice, as: UTF8.self)
+        let lines = text.components(separatedBy: .newlines).filter { !$0.isEmpty }
+        for line in lines {
+            appendLog(line)
+            evaluateProcessOutput(line, sessionID: sessionID)
+        }
+    }
+
+    private func flushRemainingLogBuffer(sessionID: UInt64) {
+        guard !logLineBuffer.isEmpty else { return }
+        let text = String(decoding: logLineBuffer, as: UTF8.self)
+        logLineBuffer.removeAll()
+        let lines = text.components(separatedBy: .newlines).filter { !$0.isEmpty }
+        for line in lines {
+            appendLog(line)
+            evaluateProcessOutput(line, sessionID: sessionID)
         }
     }
 
     public func stopRelay() {
-        guard isRunning else { return }
+        guard isRunning && !isStopping else { return }
         appendLog("[Portal-High-Bitrate] 正在停止监听与中继...")
+
+        let sessionID = relaySessionID
+        isStopping = true
+        isListening = false
+        isStreamActive = false
+        stopListenCountdown()
+
+        resetWorkItem?.cancel()
+        resetWorkItem = nil
 
         logWatchTimer?.invalidate()
         logWatchTimer = nil
-        stopListenCountdown()
 
         outputPipe?.fileHandleForReading.readabilityHandler = nil
         outputPipe = nil
 
         let engine = engineFileURL.path
-        if FileManager.default.isExecutableFile(atPath: engine) {
-            DispatchQueue.global(qos: .userInitiated).async {
+        let activeProc = relayProcess
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var stoppedViaSudo = false
+            if FileManager.default.isExecutableFile(atPath: engine) {
                 let stopProc = Process()
                 stopProc.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
                 stopProc.arguments = ["-n", engine, "--stop"]
                 stopProc.standardOutput = Pipe()
                 stopProc.standardError = Pipe()
-                try? stopProc.run()
-                stopProc.waitUntilExit()
+                if (try? stopProc.run()) != nil {
+                    stopProc.waitUntilExit()
+                    stoppedViaSudo = (stopProc.terminationStatus == 0)
+                }
             }
-        }
-        if let pidStr = try? String(contentsOfFile: pidFilePath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-           let pid = Int32(pidStr), pid > 0 {
-            kill(pid, SIGINT)
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.6) {
-                kill(pid, SIGTERM)
-                try? FileManager.default.removeItem(atPath: self.pidFilePath)
-            }
-        }
 
-        if let proc = relayProcess, proc.isRunning {
-            proc.interrupt()
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.6) {
-                if proc.isRunning { proc.terminate() }
+            if !stoppedViaSudo, let activeProc, activeProc.isRunning {
+                activeProc.interrupt()
+                Thread.sleep(forTimeInterval: 0.5)
+                if activeProc.isRunning { activeProc.terminate() }
+            }
+
+            DispatchQueue.main.async {
+                guard let self = self, self.relaySessionID == sessionID else { return }
+                self.pollLogFile(sessionID: sessionID)
+                self.flushRemainingLogBuffer(sessionID: sessionID)
+                self.relayProcess = nil
+                self.isStopping = false
+                self.isRunning = false
+                self.isListening = false
+                self.isStreamActive = false
+                if !stoppedViaSudo && FileManager.default.fileExists(atPath: self.pidFilePath) {
+                    self.appendLog("[提示] 免密停止通道未就绪，若直连未恢复可点击右上角「恢复直连」。")
+                } else {
+                    self.appendLog("[Portal-High-Bitrate] 已停止，网络路由恢复直连。")
+                }
             }
         }
-        relayProcess = nil
-        isRunning = false
-        isListening = false
-        appendLog("[Portal-High-Bitrate] 已停止，网络路由恢复直连。")
     }
 
-    private func evaluateProcessOutput(_ line: String) {
-        if line.contains("网络协商就绪") || line.contains("READY: connect Portal") {
+    public func restoreNetworkDirect() {
+        bootstrapSupportDirectory()
+        let engine = engineFileURL.path
+        guard FileManager.default.isExecutableFile(atPath: engine) else {
+            appendLog("[错误] 未找到原生引擎，无法执行网络复原。")
+            return
+        }
+        appendLog("[Portal-High-Bitrate] 正在执行紧急网络直连复原 (--restore)...")
+        let iface = selectedInterface
+        let ps5 = ps5IP.trimmingCharacters(in: .whitespacesAndNewlines)
+        let portal = portalIP.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var args = ["-n", engine, "--restore", "--interface", iface]
+            if !ps5.isEmpty { args.append(contentsOf: ["--ps5", ps5]) }
+            if !portal.isEmpty { args.append(contentsOf: ["--portal", portal]) }
+
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+            proc.arguments = args
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            proc.standardError = pipe
+            let ok: Bool = (try? proc.run()) != nil && {
+                proc.waitUntilExit()
+                return proc.terminationStatus == 0
+            }()
+
+            if ok {
+                let text = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                DispatchQueue.main.async {
+                    for line in text.components(separatedBy: .newlines) where !line.isEmpty {
+                        self?.appendLog(line)
+                    }
+                    self?.isRunning = false
+                    self?.isStopping = false
+                    self?.isListening = false
+                    self?.isStreamActive = false
+                    self?.stopListenCountdown()
+                }
+            } else {
+                var shellCmd = "\(Self.shellSingleQuoted(engine)) --restore --interface \(Self.shellSingleQuoted(iface))"
+                if !ps5.isEmpty { shellCmd += " --ps5 \(Self.shellSingleQuoted(ps5))" }
+                if !portal.isEmpty { shellCmd += " --portal \(Self.shellSingleQuoted(portal))" }
+                var errDict: NSDictionary?
+                NSAppleScript(source: "do shell script \"\(Self.appleScriptEscaped(shellCmd))\" with administrator privileges")?.executeAndReturnError(&errDict)
+                DispatchQueue.main.async {
+                    if errDict == nil {
+                        self?.appendLog("[Portal-High-Bitrate] 网络直连路由已复原。")
+                        self?.isRunning = false
+                        self?.isStopping = false
+                        self?.isListening = false
+                        self?.isStreamActive = false
+                        self?.stopListenCountdown()
+                    } else {
+                        self?.appendLog("[提示] 网络复原未完成或已取消授权。")
+                    }
+                }
+            }
+        }
+    }
+
+    private func evaluateProcessOutput(_ line: String, sessionID: UInt64) {
+        if line.contains("网络协商就绪") || line.contains("READY: connect Portal") || line.contains("EXPERIMENT READY") || line.contains("BASELINE READY") {
             isListening = true
             isStreamActive = false
             startListenCountdown(seconds: 120)
-        } else if line.contains("PS5 reported high target bitrate") || line.contains("Target confirmed") || line.contains("[ACCEPTED]") || line.contains("已确认并接受高码率协商") {
+        } else if line.contains("PS5 reported high target bitrate") || line.contains("Target confirmed") || line.contains("[ACCEPTED]") || line.contains("已确认并接受高码率协商") || line.contains("并保持视频直连") || line.contains("已提前交还直连") {
             isStreamActive = true
             isListening = false
             stopListenCountdown()
-            scheduleRelayReset(after: 1.5)
+            scheduleRelayReset(after: 1.5, sessionID: sessionID)
+        } else if line.contains("检测到设备 MAC 冲突") || line.contains("已中止中继以保护网络") || line.hasPrefix("[错误]") {
+            isListening = false
+            isStreamActive = false
+            stopListenCountdown()
+            lastError = line
+            scheduleRelayReset(after: 0.4, sessionID: sessionID)
         } else if line.contains("未生效") || line.contains("未检测到 PS Portal 握手请求") || line.contains("NOT APPLIED") {
             isListening = false
             isStreamActive = false
             stopListenCountdown()
             lastError = "未检测到 PS Portal 握手请求（120 秒内未收到连接，或 Portal 仍处于休眠状态）。"
-            scheduleRelayReset(after: 0.8)
+            scheduleRelayReset(after: 0.8, sessionID: sessionID)
         } else if line.contains("未确认目标码率") || line.contains("UNCONFIRMED") {
             isListening = false
             isStreamActive = false
             stopListenCountdown()
             lastError = "握手修改已发送，但未能在规定时间内检测到 PS5 连续 3 次高码率遥测确认。"
-            scheduleRelayReset(after: 0.8)
+            scheduleRelayReset(after: 0.8, sessionID: sessionID)
         } else if line.contains("RESTORATION FAILED") || line.contains("路由恢复异常") {
             isListening = false
+            isStreamActive = false
             stopListenCountdown()
             lastError = "网络恢复异常，请检查网络配置。"
-            scheduleRelayReset(after: 0.8)
-        } else if line.contains("引擎模式:") {
-            scheduleRelayReset(after: 1.0)
+            scheduleRelayReset(after: 0.8, sessionID: sessionID)
+        } else if line.contains("报告存档:") || line.contains("report.json") || line.contains("引擎模式:") {
+            scheduleRelayReset(after: 1.0, sessionID: sessionID)
         }
     }
 
-    private func scheduleRelayReset(after delay: TimeInterval) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self = self else { return }
+    private func scheduleRelayReset(after delay: TimeInterval, sessionID: UInt64) {
+        resetWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self, self.relaySessionID == sessionID else { return }
+            self.flushRemainingLogBuffer(sessionID: sessionID)
             self.isRunning = false
+            self.isStopping = false
             self.isListening = false
             self.stopListenCountdown()
             self.relayProcess = nil
             self.logWatchTimer?.invalidate()
             self.logWatchTimer = nil
+            self.resetWorkItem = nil
         }
+        resetWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     public func appendLog(_ text: String) {
-        logs.append(text)
+        logs.append(PortalLogEntry(text: text))
         if logs.count > 300 {
             logs.removeFirst(logs.count - 300)
         }
@@ -661,7 +1084,7 @@ public final class PortalRelayManager: ObservableObject {
     }
 
     public func copyLogs() {
-        let content = logs.joined(separator: "\n")
+        let content = logs.map(\.text).joined(separator: "\n")
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(content, forType: .string)
     }

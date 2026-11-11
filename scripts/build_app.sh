@@ -48,6 +48,9 @@ chmod +x "$MACOS_DIR/$APP_NAME"
     "$HERE/scripts/portal_engine.c" \
     -o "$RESOURCES_DIR/portal_engine"
 chmod 755 "$RESOURCES_DIR/portal_engine"
+if [ -f "$HERE/Resources/manifest.json" ]; then
+    cp "$HERE/Resources/manifest.json" "$RESOURCES_DIR/manifest.json"
+fi
 
 echo "🔍 校验通用二进制架构:"
 /usr/bin/lipo -info "$MACOS_DIR/$APP_NAME"
