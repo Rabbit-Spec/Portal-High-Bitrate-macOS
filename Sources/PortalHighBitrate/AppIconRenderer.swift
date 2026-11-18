@@ -1,13 +1,47 @@
 import SwiftUI
 import AppKit
 
-/// 渲染高解析度 Portal-High-Bitrate 应用图标并导出 .iconset 供 iconutil 打包 .icns
+/// 渲染高解析度 Portal-High-Bitrate（同步 SysPulse PS Portal 串流插件浅/深色图标）并支持运行时 Dock 主题自适应
 public enum AppIconRenderer {
+    private static func framingPreset(isDark: Bool) -> (scale: CGFloat, offsetYFraction: CGFloat) {
+        isDark ? (1.40, -0.022) : (1.44, -0.028)
+    }
+
+    public static func loadArtworkCGImage(isDark: Bool) -> CGImage? {
+        let resourceName = "PSPortalIcon-\(isDark ? "Dark" : "Light")-1024"
+        let sourceRelative = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Resources/\(resourceName).png")
+            .path
+
+        let candidates: [String?] = [
+            Bundle.main.url(forResource: resourceName, withExtension: "png")?.path,
+            Bundle.main.resourceURL?.appendingPathComponent("\(resourceName).png").path,
+            sourceRelative
+        ]
+
+        for path in candidates.compactMap({ $0 }) {
+            if FileManager.default.fileExists(atPath: path),
+               let nsImg = NSImage(contentsOfFile: path),
+               let cg = nsImg.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                return cg
+            }
+        }
+        return nil
+    }
+
     public static func generateIconset(at directoryPath: String) throws {
         let fm = FileManager.default
-        let iconsetDir = URL(fileURLWithPath: directoryPath, isDirectory: true)
-            .appendingPathComponent("AppIcon.iconset", isDirectory: true)
-        try fm.createDirectory(at: iconsetDir, withIntermediateDirectories: true)
+        let baseDir = URL(fileURLWithPath: directoryPath, isDirectory: true)
+        let lightDir = baseDir.appendingPathComponent("AppIcon-Light.iconset", isDirectory: true)
+        let darkDir = baseDir.appendingPathComponent("AppIcon-Dark.iconset", isDirectory: true)
+
+        try? fm.removeItem(at: lightDir)
+        try? fm.removeItem(at: darkDir)
+        try fm.createDirectory(at: lightDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: darkDir, withIntermediateDirectories: true)
 
         let specs: [(name: String, px: Int)] = [
             ("icon_16x16.png", 16),
@@ -23,21 +57,31 @@ public enum AppIconRenderer {
         ]
 
         for spec in specs {
-            if let data = renderPNGData(pixelSize: spec.px) {
-                try data.write(to: iconsetDir.appendingPathComponent(spec.name))
+            if let lightData = renderPNGData(pixelSize: spec.px, isDark: false) {
+                try lightData.write(to: lightDir.appendingPathComponent(spec.name))
+            }
+            if let darkData = renderPNGData(pixelSize: spec.px, isDark: true) {
+                try darkData.write(to: darkDir.appendingPathComponent(spec.name))
             }
         }
     }
 
-    public static func renderNSImage(pixelSize: Int = 512) -> NSImage {
+    public static func exportAppIconPNG(to filePath: String, pixelSize: Int = 1024, isDark: Bool = false) throws {
+        guard let data = renderPNGData(pixelSize: pixelSize, isDark: isDark) else {
+            throw NSError(domain: "AppIconRenderer", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to render PNG"])
+        }
+        try data.write(to: URL(fileURLWithPath: filePath))
+    }
+
+    public static func renderNSImage(pixelSize: Int = 512, isDark: Bool = false) -> NSImage {
         let image = NSImage(size: NSSize(width: pixelSize, height: pixelSize))
-        if let data = renderPNGData(pixelSize: pixelSize), let rep = NSBitmapImageRep(data: data) {
+        if let data = renderPNGData(pixelSize: pixelSize, isDark: isDark), let rep = NSBitmapImageRep(data: data) {
             image.addRepresentation(rep)
         }
         return image
     }
 
-    private static func renderPNGData(pixelSize: Int) -> Data? {
+    private static func renderPNGData(pixelSize: Int, isDark: Bool) -> Data? {
         guard let rep = NSBitmapImageRep(
             bitmapDataPlanes: nil,
             pixelsWide: pixelSize,
@@ -58,16 +102,20 @@ public enum AppIconRenderer {
         let ctx = nsCtx.cgContext
         let s = CGFloat(pixelSize)
 
-        // macOS 圆角矩形容器外边距 (约 10% inset)
-        let inset = s * 0.095
+        let inset = s * 0.098
         let rect = CGRect(x: inset, y: inset, width: s - inset * 2, height: s - inset * 2)
         let corner = rect.width * 0.225
         let squircle = CGPath(roundedRect: rect, cornerWidth: corner, cornerHeight: corner, transform: nil)
 
+        // macOS 标准 Dock 图标外阴影
         ctx.saveGState()
-        ctx.setShadow(offset: CGSize(width: 0, height: -s * 0.018), blur: s * 0.04, color: NSColor.black.withAlphaComponent(0.32).cgColor)
+        ctx.setShadow(
+            offset: CGSize(width: 0, height: -rect.width * 0.025),
+            blur: rect.width * 0.045,
+            color: NSColor.black.withAlphaComponent(isDark ? 0.65 : 0.22).cgColor
+        )
         ctx.addPath(squircle)
-        ctx.setFillColor(NSColor(calibratedRed: 0.07, green: 0.14, blue: 0.36, alpha: 1.0).cgColor)
+        ctx.setFillColor(isDark ? NSColor(calibratedWhite: 0.08, alpha: 1.0).cgColor : NSColor(calibratedWhite: 0.96, alpha: 1.0).cgColor)
         ctx.fillPath()
         ctx.restoreGState()
 
@@ -75,6 +123,31 @@ public enum AppIconRenderer {
         ctx.addPath(squircle)
         ctx.clip()
 
+        if let artwork = loadArtworkCGImage(isDark: isDark) {
+            let framing = framingPreset(isDark: isDark)
+            let scaledW = rect.width * framing.scale
+            let scaledH = rect.height * framing.scale
+            // CoreGraphics Y 轴向上，SwiftUI offset(y: negative) 对应此处正向向上偏移
+            let drawX = rect.midX - scaledW * 0.5
+            let drawY = rect.midY - scaledH * 0.5 - (rect.height * framing.offsetYFraction)
+            ctx.interpolationQuality = .high
+            ctx.draw(artwork, in: CGRect(x: drawX, y: drawY, width: scaledW, height: scaledH))
+        } else {
+            drawVectorFallback(in: ctx, rect: rect, s: s)
+        }
+
+        // 内边框柔和描边
+        ctx.addPath(squircle)
+        ctx.setStrokeColor(isDark ? NSColor.white.withAlphaComponent(0.16).cgColor : NSColor.black.withAlphaComponent(0.08).cgColor)
+        ctx.setLineWidth(max(1.0, s * 0.01))
+        ctx.strokePath()
+
+        ctx.restoreGState()
+        NSGraphicsContext.restoreGraphicsState()
+        return rep.representation(using: .png, properties: [:])
+    }
+
+    private static func drawVectorFallback(in ctx: CGContext, rect: CGRect, s: CGFloat) {
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let bgColors = [
             NSColor(calibratedRed: 0.06, green: 0.11, blue: 0.28, alpha: 1.0).cgColor,
@@ -89,26 +162,12 @@ public enum AppIconRenderer {
                 options: []
             )
         }
-
-        // 顶部柔和液态高光
-        let glowCenter = CGPoint(x: s * 0.36, y: s * 0.72)
-        let glowColors = [
-            NSColor(calibratedRed: 0.42, green: 0.85, blue: 1.0, alpha: 0.40).cgColor,
-            NSColor(calibratedRed: 0.42, green: 0.85, blue: 1.0, alpha: 0.0).cgColor
-        ] as CFArray
-        if let glow = CGGradient(colorsSpace: colorSpace, colors: glowColors, locations: [0.0, 1.0]) {
-            ctx.drawRadialGradient(glow, startCenter: glowCenter, startRadius: 0, endCenter: glowCenter, endRadius: s * 0.45, options: [])
-        }
-
-        // 掌机宽屏外框 (Portal 剪影)
         let bodyW = rect.width * 0.68
         let bodyH = rect.height * 0.34
         let bodyRect = CGRect(x: s * 0.5 - bodyW * 0.5, y: s * 0.45 - bodyH * 0.5, width: bodyW, height: bodyH)
         let screenW = bodyW * 0.62
         let screenH = bodyH * 0.84
         let screenRect = CGRect(x: s * 0.5 - screenW * 0.5, y: bodyRect.midY - screenH * 0.5, width: screenW, height: screenH)
-
-        // 左右手柄握把
         let handleW = bodyW * 0.23
         let leftHandle = CGRect(x: bodyRect.minX, y: bodyRect.minY - bodyH * 0.14, width: handleW, height: bodyH * 1.18)
         let rightHandle = CGRect(x: bodyRect.maxX - handleW, y: bodyRect.minY - bodyH * 0.14, width: handleW, height: bodyH * 1.18)
@@ -119,67 +178,172 @@ public enum AppIconRenderer {
         ctx.addPath(CGPath(roundedRect: rightHandle, cornerWidth: handleW * 0.48, cornerHeight: handleW * 0.48, transform: nil))
         ctx.fillPath()
 
-        // 中央屏幕边框
         let bezelRect = screenRect.insetBy(dx: -s * 0.015, dy: -s * 0.015)
         ctx.setFillColor(NSColor(calibratedWhite: 0.96, alpha: 1.0).cgColor)
         ctx.addPath(CGPath(roundedRect: bezelRect, cornerWidth: s * 0.025, cornerHeight: s * 0.025, transform: nil))
         ctx.fillPath()
-
-        // 屏幕内部发光渐变
-        ctx.saveGState()
-        let screenPath = CGPath(roundedRect: screenRect, cornerWidth: s * 0.016, cornerHeight: s * 0.016, transform: nil)
-        ctx.addPath(screenPath)
-        ctx.clip()
-        let scrColors = [
-            NSColor(calibratedRed: 0.05, green: 0.14, blue: 0.35, alpha: 1.0).cgColor,
-            NSColor(calibratedRed: 0.06, green: 0.64, blue: 0.95, alpha: 1.0).cgColor
-        ] as CFArray
-        if let scrGrad = CGGradient(colorsSpace: colorSpace, colors: scrColors, locations: [0.0, 1.0]) {
-            ctx.drawLinearGradient(
-                scrGrad,
-                start: CGPoint(x: screenRect.minX, y: screenRect.minY),
-                end: CGPoint(x: screenRect.maxX, y: screenRect.maxY),
-                options: []
-            )
-        }
-        ctx.restoreGState()
-
-        // 顶部高速码率无线信号弧 (三道亮青色弧线)
-        let arcCenter = CGPoint(x: s * 0.5, y: screenRect.maxY + s * 0.02)
-        ctx.setLineCap(.round)
-        for i in 1...3 {
-            let r = s * (0.06 + CGFloat(i) * 0.045)
-            ctx.setStrokeColor(NSColor(calibratedRed: 0.55, green: 0.94, blue: 1.0, alpha: 1.0 - CGFloat(i - 1) * 0.18).cgColor)
-            ctx.setLineWidth(s * 0.026)
-            ctx.beginPath()
-            ctx.addArc(center: arcCenter, radius: r, startAngle: .pi * 0.24, endAngle: .pi * 0.76, clockwise: false)
-            ctx.strokePath()
-        }
-
-        // 内边框微弱高光描边
-        ctx.addPath(squircle)
-        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.28).cgColor)
-        ctx.setLineWidth(max(1.0, s * 0.012))
-        ctx.strokePath()
-
-        ctx.restoreGState()
-        NSGraphicsContext.restoreGraphicsState()
-        return rep.representation(using: .png, properties: [:])
     }
 }
 
+/// 同步 SysPulse PS Portal 插件艺术插画的自适应 SwiftUI 图标组件
 public struct PortalAppIconView: View {
-    private static let sharedIcon: NSImage = AppIconRenderer.renderNSImage(pixelSize: 256)
+    @Environment(\.colorScheme) private var envColorScheme
     public let size: CGFloat
+    public var forcedColorScheme: ColorScheme? = nil
+    public var isCircle: Bool = false
 
-    public init(size: CGFloat = 64) {
+    private static var cachedImages: [String: NSImage] = [:]
+
+    public init(size: CGFloat = 64, forcedColorScheme: ColorScheme? = nil, isCircle: Bool = false) {
         self.size = size
+        self.forcedColorScheme = forcedColorScheme
+        self.isCircle = isCircle
+    }
+
+    private var activeScheme: ColorScheme {
+        forcedColorScheme ?? envColorScheme
     }
 
     public var body: some View {
-        Image(nsImage: Self.sharedIcon)
-            .resizable()
-            .interpolation(.high)
-            .frame(width: size, height: size)
+        let isDark = (activeScheme == .dark)
+        let cornerRadius = size * 0.225
+        let squircle = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+
+        ZStack {
+            if let image = Self.loadDownsampledArtwork(isDark: isDark) {
+                let scale: CGFloat = isDark ? 1.40 : 1.44
+                let offsetYFraction: CGFloat = isDark ? -0.022 : -0.028
+                let img = Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .scaleEffect(scale)
+                    .offset(y: size * offsetYFraction)
+                    .frame(width: size, height: size)
+
+                if isCircle {
+                    img.clipShape(Circle())
+                } else {
+                    img
+                        .clipShape(squircle)
+                        .overlay(
+                            squircle
+                                .strokeBorder(
+                                    isDark ? Color.white.opacity(0.14) : Color.black.opacity(0.06),
+                                    lineWidth: 0.8
+                                )
+                        )
+                }
+            } else {
+                Image(nsImage: Self.fallbackIcon(isDark: isDark))
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: size, height: size)
+                    .clipShape(isCircle ? AnyShape(Circle()) : AnyShape(squircle))
+            }
+        }
+        .frame(width: size, height: size)
+    }
+
+    private static func loadDownsampledArtwork(isDark: Bool) -> NSImage? {
+        let key = isDark ? "PSPortalIcon-Dark-1024" : "PSPortalIcon-Light-1024"
+        if let cached = cachedImages[key] {
+            return cached
+        }
+        guard let cgImage = AppIconRenderer.loadArtworkCGImage(isDark: isDark) else {
+            return nil
+        }
+        let maxPixelSize: CGFloat = 256
+        let w = CGFloat(cgImage.width)
+        let h = CGFloat(cgImage.height)
+        let scale = max(w, h) > maxPixelSize ? (maxPixelSize / max(w, h)) : 1.0
+        let targetW = max(1, Int(round(w * scale)))
+        let targetH = max(1, Int(round(h * scale)))
+
+        let srgbSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
+        guard let ctx = CGContext(
+            data: nil,
+            width: targetW,
+            height: targetH,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: srgbSpace,
+            bitmapInfo: bitmapInfo
+        ) else {
+            return NSImage(cgImage: cgImage, size: NSSize(width: w, height: h))
+        }
+        ctx.interpolationQuality = .high
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: targetW, height: targetH))
+        guard let scaledCG = ctx.makeImage() else {
+            return NSImage(cgImage: cgImage, size: NSSize(width: w, height: h))
+        }
+        let img = NSImage(cgImage: scaledCG, size: NSSize(width: targetW, height: targetH))
+        cachedImages[key] = img
+        return img
+    }
+
+    private static func fallbackIcon(isDark: Bool) -> NSImage {
+        let key = isDark ? "fallback-dark" : "fallback-light"
+        if let cached = cachedImages[key] {
+            return cached
+        }
+        let img = AppIconRenderer.renderNSImage(pixelSize: 256, isDark: isDark)
+        cachedImages[key] = img
+        return img
+    }
+}
+
+/// 运行时跟随系统浅色 / 深色外观切换 Dock 图标
+@MainActor
+public final class PortalAppIconManager {
+    public static let shared = PortalAppIconManager()
+
+    private var appearanceObservation: NSKeyValueObservation?
+    private var currentModeIsDark: Bool? = nil
+
+    private init() {}
+
+    public static var isSystemInDarkMode: Bool {
+        if let val = CFPreferencesCopyAppValue("AppleInterfaceStyle" as CFString, kCFPreferencesAnyApplication as CFString) as? String {
+            return val.caseInsensitiveCompare("dark") == .orderedSame
+        }
+        return false
+    }
+
+    public func startObservingSystemAppearance() {
+        applyCurrentAppearanceIcon(force: true)
+
+        appearanceObservation = NSApp.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
+            Task { @MainActor in
+                self?.applyCurrentAppearanceIcon(force: false)
+            }
+        }
+
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.applyCurrentAppearanceIcon(force: true)
+            }
+        }
+    }
+
+    public func applyCurrentAppearanceIcon(force: Bool = false) {
+        let isDark = Self.isSystemInDarkMode
+        if !force, let current = currentModeIsDark, current == isDark {
+            return
+        }
+        currentModeIsDark = isDark
+
+        let iconResourceName = isDark ? "AppIcon-Dark" : "AppIcon-Light"
+        if let iconURL = Bundle.main.url(forResource: iconResourceName, withExtension: "icns"),
+           let image = NSImage(contentsOf: iconURL) {
+            NSApp.applicationIconImage = image
+        } else {
+            NSApp.applicationIconImage = AppIconRenderer.renderNSImage(pixelSize: 512, isDark: isDark)
+        }
+        NSApp.dockTile.display()
     }
 }

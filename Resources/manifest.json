@@ -1,7 +1,7 @@
 {
   "id": "com.rabbit.portal-high-bitrate",
   "name": "PS Portal 串流画质增强",
-  "version": "0.1.2",
+  "version": "0.1.5",
   "installedCommitSHA": "4430daa",
   "installedCommitDate": "2026-10-21",
   "installedCommitMsg": "docs: add October 21 Raspberry Pi and mobile update",
@@ -11,7 +11,6 @@
   "description": "突破 PlayStation Portal 官方默认串流比特率限制，通过局域网握手阶段重写比特率参数，实现 65 Mbps / 100 Mbps / 200 Mbps 极致清晰度，无需对 PS5 或 PS Portal 进行任何越狱与硬改。",
   "entry": "portal_engine",
   "defaultConfig": {
-    "relayMode": "oneway",
     "targetBitrate": "100M",
     "interface": "en0",
     "ps5IP": "",

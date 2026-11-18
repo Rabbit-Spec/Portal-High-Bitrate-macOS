@@ -51,14 +51,24 @@ chmod 755 "$RESOURCES_DIR/portal_engine"
 if [ -f "$HERE/Resources/manifest.json" ]; then
     cp "$HERE/Resources/manifest.json" "$RESOURCES_DIR/manifest.json"
 fi
+if [ -f "$HERE/Resources/ieee_oui.tsv" ]; then
+    cp "$HERE/Resources/ieee_oui.tsv" "$RESOURCES_DIR/ieee_oui.tsv"
+fi
+for suffix in Light Dark; do
+    if [ -f "$HERE/Resources/PSPortalIcon-${suffix}-1024.png" ]; then
+        cp "$HERE/Resources/PSPortalIcon-${suffix}-1024.png" "$RESOURCES_DIR/"
+    fi
+done
 
 echo "🔍 校验通用二进制架构:"
 /usr/bin/lipo -info "$MACOS_DIR/$APP_NAME"
 /usr/bin/lipo -info "$RESOURCES_DIR/portal_engine"
 
-echo "🎨 正在生成应用图标 (AppIcon.icns)..."
+echo "🎨 正在生成自适应浅/深色应用图标 (AppIcon-Light.icns & AppIcon-Dark.icns)..."
 "$MACOS_DIR/$APP_NAME" --generate-icons "$ICON_TMP_DIR"
-/usr/bin/iconutil -c icns "$ICON_TMP_DIR/AppIcon.iconset" -o "$RESOURCES_DIR/AppIcon.icns"
+/usr/bin/iconutil -c icns "$ICON_TMP_DIR/AppIcon-Light.iconset" -o "$RESOURCES_DIR/AppIcon-Light.icns"
+/usr/bin/iconutil -c icns "$ICON_TMP_DIR/AppIcon-Dark.iconset" -o "$RESOURCES_DIR/AppIcon-Dark.icns"
+cp "$RESOURCES_DIR/AppIcon-Light.icns" "$RESOURCES_DIR/AppIcon.icns"
 
 cat << EOF > "$CONTENTS_DIR/Info.plist"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -85,6 +95,11 @@ cat << EOF > "$CONTENTS_DIR/Info.plist"
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
     <key>NSLocalNetworkUsageDescription</key>
     <string>Portal-High-Bitrate 需要访问局域网以扫描 PS5 / PS Portal 设备并执行局域网串流码率增强。</string>
 </dict>

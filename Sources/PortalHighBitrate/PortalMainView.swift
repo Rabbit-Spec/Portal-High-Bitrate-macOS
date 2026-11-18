@@ -8,6 +8,13 @@ public enum AppTab: String, CaseIterable, Identifiable {
     public var id: String { rawValue }
 }
 
+private struct LogContentHeightPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
 public struct PortalMainView: View {
     @ObservedObject private var manager = PortalRelayManager.shared
     @Binding var selectedTab: AppTab
@@ -84,7 +91,7 @@ public struct PortalMainView: View {
                 ZStack {
                     Circle()
                         .fill(colorScheme == .dark ? Color.white.opacity(0.12) : Color.black.opacity(0.06))
-                    PortalAppIconView(size: 28)
+                    PortalAppIconView(size: 28, isCircle: true)
                 }
                 .frame(width: 32, height: 32)
                 .padding(.leading, 3)
@@ -197,7 +204,7 @@ public struct PortalMainView: View {
         HStack(spacing: 8) {
             HStack(spacing: 6) {
                 Circle()
-                    .fill(manager.isStreamActive ? Color.green : (manager.isListening ? Color.orange : Color.blue))
+                    .fill(statusBadgeColor)
                     .frame(width: 7, height: 7)
                 if let updateMsg = manager.updateStatusMessage, !updateMsg.isEmpty {
                     Text(updateMsg)
@@ -279,31 +286,17 @@ public struct PortalMainView: View {
         VStack(spacing: 16) {
             // 顶部信息与启停按钮
             HStack(alignment: .center, spacing: 16) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 16)
-                        .fill(
-                            LinearGradient(
-                                colors: [Color.blue.opacity(0.85), Color.indigo.opacity(0.9)],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                        .frame(width: 54, height: 54)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 16)
-                                .strokeBorder(Color.white.opacity(0.3), lineWidth: 1)
-                        )
-
-                    Image(systemName: "gamecontroller.fill")
-                        .font(.system(size: 26))
-                        .foregroundStyle(Color.white)
-                }
+                PortalAppIconView(
+                    size: 58,
+                    forcedColorScheme: colorScheme
+                )
 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 8) {
                         Text("PS Portal 串流画质增强")
                             .font(.system(size: 18, weight: .bold, design: .rounded))
                             .foregroundStyle(primaryText)
+                            .lineLimit(1)
 
                         Text("v\(manager.pluginVersion)")
                             .font(.system(size: 11, weight: .bold, design: .monospaced))
@@ -312,8 +305,9 @@ public struct PortalMainView: View {
                             .padding(.vertical, 2)
                             .background(Capsule().fill(Color.blue.opacity(0.14)))
 
-                        if manager.isListening {
+                        if manager.engineState != .disabled {
                             statusBadgeView
+                                .fixedSize(horizontal: true, vertical: false)
                         }
                     }
 
@@ -321,6 +315,7 @@ public struct PortalMainView: View {
                         Text("开源项目:")
                             .font(.system(size: 12))
                             .foregroundStyle(secondaryText)
+                            .fixedSize(horizontal: true, vertical: false)
 
                         Button {
                             if let url = URL(string: manager.pluginRepo) {
@@ -331,6 +326,7 @@ public struct PortalMainView: View {
                                 Text("atameric/ps5-portal-high-bitrate")
                                     .font(.system(size: 12, weight: .medium))
                                     .foregroundStyle(Color.cyan)
+                                    .lineLimit(1)
                                 Image(systemName: "arrow.up.right.square")
                                     .font(.system(size: 10))
                                     .foregroundStyle(Color.cyan)
@@ -342,22 +338,106 @@ public struct PortalMainView: View {
                         Text("· 无需硬改与越狱，动态协议修改提升比特率")
                             .font(.system(size: 12))
                             .foregroundStyle(secondaryText)
+                            .lineLimit(1)
                     }
 
+                    // 实时运行状态提示语
                     HStack(spacing: 6) {
-                        Image(systemName: "checkmark.shield.fill")
+                        Image(systemName: manager.isStreamActive ? "sparkles" : (manager.autoWatchEnabled ? "eye.fill" : "checkmark.shield.fill"))
                             .font(.system(size: 11))
-                            .foregroundStyle(Color.blue)
-                        Text("管理员特权注入 (真实 ARP 伪装与比特率修改，首次授权后自动免密)")
+                            .foregroundStyle(manager.isStreamActive ? Color.green : Color.blue)
+                        Text(manager.engineState.subtitle(bitrateTag: manager.targetBitrate.shortTag))
                             .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(primaryText.opacity(0.9))
+                            .lineLimit(2)
                     }
                     .padding(.top, 2)
                 }
-
-                Spacer()
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
 
                 HStack(spacing: 10) {
+                    // Debug 详细诊断开关胶囊
+                    Toggle(isOn: Binding(
+                        get: { manager.debugModeEnabled },
+                        set: { manager.setDebugModeEnabled($0) }
+                    )) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "ladybug.fill")
+                                .font(.system(size: 11.5, weight: .semibold))
+                                .foregroundStyle(manager.debugModeEnabled ? Color.orange : secondaryText)
+                            Text("Debug")
+                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(manager.debugModeEnabled ? Color.orange : primaryText)
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(
+                        Capsule()
+                            .fill(manager.debugModeEnabled ? Color.orange.opacity(0.14) : (colorScheme == .dark ? Color.white.opacity(0.06) : Color.black.opacity(0.04)))
+                            .overlay(Capsule().strokeBorder(manager.debugModeEnabled ? Color.orange.opacity(0.42) : cardBorder, lineWidth: 0.8))
+                    )
+                    .help("开启后记录完整 ARP 包、分片重组与 UDP/9296 十六进制握手诊断日志，并同步写入 ~/Library/Logs/Portal-High-Bitrate/psportal.log")
+
+                    // 自动增强守望开关胶囊（纯旁路只读 BPF + 触发式按需激活）
+                    Toggle(isOn: Binding(
+                        get: { manager.autoWatchEnabled },
+                        set: { manager.setAutoWatchEnabled($0) }
+                    )) {
+                        HStack(spacing: 5) {
+                            Image(systemName: "bolt.badge.automatic")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(manager.autoWatchEnabled ? Color.blue : secondaryText)
+                            Text("自动增强")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(manager.autoWatchEnabled ? Color.blue : primaryText)
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(
+                        Capsule()
+                            .fill(manager.autoWatchEnabled ? Color.blue.opacity(0.12) : (colorScheme == .dark ? Color.white.opacity(0.06) : Color.black.opacity(0.04)))
+                            .overlay(Capsule().strokeBorder(manager.autoWatchEnabled ? Color.blue.opacity(0.35) : cardBorder, lineWidth: 0.8))
+                    )
+                    .help("开启后采用零干扰只读 BPF 守望，Portal 唤醒连接 PS5 时自动激活高码率增强")
+
+                    if case .enhancingActive = manager.engineState {
+                        Button {
+                            manager.endEnhancementSession(reason: "用户手动重置画质增强会话状态")
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "checkmark.circle")
+                                    .font(.system(size: 11.5))
+                                Text("结束会话")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .lineLimit(1)
+                                    .fixedSize(horizontal: true, vertical: false)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .background(
+                                Capsule()
+                                    .fill(Color.green.opacity(0.14))
+                                    .overlay(Capsule().strokeBorder(Color.green.opacity(0.35), lineWidth: 0.8))
+                            )
+                            .foregroundStyle(Color.green)
+                        }
+                        .buttonStyle(.plain)
+                        .pointingHandCursor()
+                    }
+
+                    // 兜底复原网络直连入口
                     Button {
                         manager.restoreNetworkDirect()
                     } label: {
@@ -366,26 +446,31 @@ public struct PortalMainView: View {
                                 .font(.system(size: 12))
                             Text("恢复直连")
                                 .font(.system(size: 12, weight: .medium))
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
                         }
                         .padding(.horizontal, 12)
                         .padding(.vertical, 9)
                         .background(
                             Capsule()
-                                .fill(cardFill)
+                                .fill(colorScheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
                                 .overlay(Capsule().strokeBorder(cardBorder, lineWidth: 0.8))
                         )
                         .foregroundStyle(secondaryText)
                     }
                     .buttonStyle(.plain)
-                    .onHover { inside in
-                        if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() }
-                    }
+                    .pointingHandCursor()
                     .disabled(manager.isRunning || manager.isStopping)
                     .help("异常退出后若设备无法连接，点此立即清理 ARP 缓存并恢复直连")
 
+                    // 一键启停主按钮
                     Button {
                         if manager.isRunning {
-                            manager.stopRelay()
+                            if manager.autoWatchEnabled {
+                                manager.setAutoWatchEnabled(false)
+                            } else {
+                                manager.stopRelay()
+                            }
                         } else {
                             manager.startRelay()
                         }
@@ -393,8 +478,10 @@ public struct PortalMainView: View {
                         HStack(spacing: 8) {
                             Image(systemName: manager.isRunning ? "stop.fill" : "play.fill")
                                 .font(.system(size: 13, weight: .bold))
-                            Text(manager.isStopping ? "停止中..." : (manager.isRunning ? "停止增强" : "启动画质增强"))
+                            Text(manager.isStopping ? "停止中..." : (manager.isRunning ? (manager.autoWatchEnabled ? "停止守望" : "停止增强") : "启动画质增强"))
                                 .font(.system(size: 14, weight: .bold))
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
                         }
                         .padding(.horizontal, 20)
                         .padding(.vertical, 10)
@@ -402,8 +489,8 @@ public struct PortalMainView: View {
                             Capsule()
                                 .fill(
                                     manager.isRunning
-                                        ? Color.red.opacity(manager.isStopping ? 0.5 : 0.88)
-                                        : (colorScheme == .dark ? Color.white : Color(white: 0.14))
+                                        ? Color.red.opacity(manager.isStopping ? 0.5 : 0.85)
+                                        : (colorScheme == .dark ? Color.white : Color(white: 0.15))
                                 )
                         )
                         .foregroundStyle(
@@ -413,11 +500,11 @@ public struct PortalMainView: View {
                         )
                     }
                     .buttonStyle(.plain)
-                    .onHover { inside in
-                        if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() }
-                    }
+                    .pointingHandCursor()
                     .disabled(manager.isStopping)
                 }
+                .fixedSize(horizontal: true, vertical: false)
+                .layoutPriority(1)
             }
 
             if let errorText = manager.lastError {
@@ -447,7 +534,7 @@ public struct PortalMainView: View {
                 )
             }
 
-            Divider().opacity(0.25)
+            Divider().opacity(0.2)
 
             // 码率与网络参数
             HStack(alignment: .top, spacing: 24) {
@@ -485,10 +572,17 @@ public struct PortalMainView: View {
                                 .frame(maxWidth: .infinity, minHeight: 58, alignment: .leading)
                                 .background(
                                     RoundedRectangle(cornerRadius: 10)
-                                        .fill(isSelected ? Color.blue.opacity(0.85) : cardFill)
+                                        .fill(
+                                            isSelected
+                                                ? Color.blue.opacity(0.85)
+                                                : (colorScheme == .dark ? Color.white.opacity(0.06) : Color.black.opacity(0.04))
+                                        )
                                         .overlay(
                                             RoundedRectangle(cornerRadius: 10)
-                                                .strokeBorder(isSelected ? Color.blue : cardBorder, lineWidth: 0.8)
+                                                .strokeBorder(
+                                                    isSelected ? Color.blue : cardBorder,
+                                                    lineWidth: 0.8
+                                                )
                                         )
                                 )
                             }
@@ -529,7 +623,7 @@ public struct PortalMainView: View {
                         .padding(3)
                         .background(
                             Capsule()
-                                .fill(cardFill)
+                                .fill(colorScheme == .dark ? Color.white.opacity(0.06) : Color.black.opacity(0.04))
                                 .overlay(Capsule().strokeBorder(cardBorder, lineWidth: 0.8))
                         )
                         .disabled(manager.isRunning)
@@ -582,7 +676,7 @@ public struct PortalMainView: View {
                             }
                             .foregroundStyle(Color.blue)
 
-                            TextField("例如 192.168.50.50", text: $manager.ps5IP)
+                            TextField("例如 192.168.1.50", text: $manager.ps5IP)
                                 .textFieldStyle(.plain)
                                 .font(.system(size: 13, weight: .medium, design: .monospaced))
                                 .foregroundStyle(Color.blue)
@@ -606,7 +700,7 @@ public struct PortalMainView: View {
                             }
                             .foregroundStyle(Color.indigo)
 
-                            TextField("例如 192.168.50.107", text: $manager.portalIP)
+                            TextField("例如 192.168.1.107", text: $manager.portalIP)
                                 .textFieldStyle(.plain)
                                 .font(.system(size: 13, weight: .medium, design: .monospaced))
                                 .foregroundStyle(Color.indigo)
@@ -622,53 +716,63 @@ public struct PortalMainView: View {
                         }
                     }
 
-                    // 扫描到的 Sony 设备快捷填入条（保持固定最低高度，确保与左侧底部间距一致）
+                    // 扫描到的 Sony 设备快捷填入条
                     let sonyDevices = manager.discoveredDevices.filter { $0.isLikelySony }
-                    Group {
+                    HStack(spacing: 8) {
                         if !sonyDevices.isEmpty {
-                            HStack(spacing: 8) {
-                                Text("检测到 Sony 设备:")
-                                    .font(.system(size: 11.5, weight: .medium))
-                                    .foregroundStyle(secondaryText)
+                            Text("检测到 Sony 设备:")
+                                .font(.system(size: 11.5, weight: .medium))
+                                .foregroundStyle(secondaryText)
 
-                                ScrollView(.horizontal, showsIndicators: false) {
-                                    HStack(spacing: 6) {
-                                        ForEach(sonyDevices) { dev in
-                                            Menu {
-                                                Button("设为 PS5 IP (\(dev.ip))") {
-                                                    manager.ps5IP = dev.ip
-                                                    manager.saveConfig()
-                                                }
-                                                Button("设为 PS Portal IP (\(dev.ip))") {
-                                                    manager.portalIP = dev.ip
-                                                    manager.saveConfig()
-                                                }
-                                            } label: {
-                                                let isPS5Role = dev.role == .ps5Host
-                                                let roleTag = isPS5Role ? "PS5" : (dev.role == .portalClient ? "Portal" : "Sony")
-                                                let iconName = isPS5Role ? "tv.fill" : "gamecontroller.fill"
-                                                let tintColor: Color = isPS5Role ? .blue : .indigo
-                                                HStack(spacing: 4.5) {
-                                                    Image(systemName: iconName)
-                                                        .font(.system(size: 10.5))
-                                                    Text("\(roleTag) · \(dev.ip)")
-                                                        .font(.system(size: 11.5, weight: .medium, design: .monospaced))
-                                                }
-                                                .foregroundStyle(tintColor)
-                                                .padding(.horizontal, 9)
-                                                .padding(.vertical, 4)
-                                                .background(
-                                                    Capsule()
-                                                        .fill(tintColor.opacity(0.12))
-                                                        .overlay(Capsule().strokeBorder(tintColor.opacity(0.3), lineWidth: 0.8))
-                                                )
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 6) {
+                                    ForEach(sonyDevices) { dev in
+                                        Menu {
+                                            Button("设为 PS5 IP (\(dev.ip))") {
+                                                manager.bindDiscoveredDevice(dev, as: .ps5Host)
                                             }
-                                            .buttonStyle(.plain)
-                                            .disabled(manager.isRunning || manager.isStopping)
+                                            Button("设为 PS Portal IP (\(dev.ip))") {
+                                                manager.bindDiscoveredDevice(dev, as: .portalClient)
+                                            }
+                                            if let iface = dev.interfaceName, iface != manager.selectedInterface {
+                                                Button("切换至所在网卡 (\(iface))") {
+                                                    manager.selectInterface(iface)
+                                                }
+                                            }
+                                        } label: {
+                                            let isPS5Role = dev.role == .ps5Host
+                                            let roleTag = isPS5Role ? "PS5" : (dev.role == .portalClient ? "Portal" : "Sony")
+                                            let iconName = isPS5Role ? "tv.fill" : "gamecontroller.fill"
+                                            let tintColor: Color = isPS5Role ? .blue : .indigo
+                                            let crossIface = dev.interfaceName != nil && dev.interfaceName != manager.selectedInterface
+                                            HStack(spacing: 4.5) {
+                                                Image(systemName: iconName)
+                                                    .font(.system(size: 10.5))
+                                                Text("\(roleTag) · \(dev.ip)")
+                                                    .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+                                                if crossIface, let iface = dev.interfaceName {
+                                                    Text("(\(iface))")
+                                                        .font(.system(size: 10, design: .monospaced))
+                                                        .foregroundStyle(Color.orange)
+                                                }
+                                            }
+                                            .foregroundStyle(tintColor)
+                                            .padding(.horizontal, 9)
+                                            .padding(.vertical, 4)
+                                            .background(
+                                                Capsule()
+                                                    .fill(tintColor.opacity(0.12))
+                                                    .overlay(Capsule().strokeBorder(tintColor.opacity(0.3), lineWidth: 0.8))
+                                            )
                                         }
+                                        .buttonStyle(.plain)
+                                        .pointingHandCursor()
+                                        .disabled(manager.isRunning || manager.isStopping)
+                                        .help(dev.matchReasons.isEmpty ? dev.label : "\(dev.label) · 依据: \(dev.matchReasons.joined(separator: ", "))")
                                     }
                                 }
                             }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         } else {
                             HStack(spacing: 6) {
                                 Image(systemName: "info.circle")
@@ -687,9 +791,9 @@ public struct PortalMainView: View {
         }
         .padding(18)
         .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(cardFill)
-                .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(cardBorder, lineWidth: 0.8))
+                .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(cardBorder, lineWidth: 0.8))
         )
     }
 
@@ -735,7 +839,7 @@ public struct PortalMainView: View {
             .frame(minHeight: 38)
             .background(
                 RoundedRectangle(cornerRadius: 8)
-                    .fill(cardFill)
+                    .fill(colorScheme == .dark ? Color.white.opacity(0.06) : Color.black.opacity(0.04))
                     .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(cardBorder, lineWidth: 0.8))
             )
         }
@@ -744,26 +848,48 @@ public struct PortalMainView: View {
         .disabled(manager.isRunning)
     }
 
+    // MARK: - 状态指示徽章 (全状态周期)
+
+    private var statusBadgeColor: Color {
+        switch manager.engineState {
+        case .disabled:
+            return .gray
+        case .idle:
+            return .blue
+        case .authorizing, .starting, .autoBursting, .manualListening, .stopping:
+            return .orange
+        case .autoWatching:
+            return .cyan
+        case .enhancingActive:
+            return .green
+        case .suspendedOutOfLAN, .needsConfiguration, .deviceOffline, .alreadyStreamingHint:
+            return .yellow
+        case .error:
+            return .red
+        }
+    }
+
     private var statusBadgeView: some View {
-        HStack(spacing: 6) {
+        let tint = statusBadgeColor
+        return HStack(spacing: 6) {
             Circle()
-                .fill(Color.orange)
+                .fill(tint)
                 .frame(width: 7, height: 7)
-            if let remaining = manager.listenRemainingSeconds {
-                Text("正在监听握手 · \(remaining)s")
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .monospacedDigit()
-                    .foregroundStyle(Color.orange)
-            } else {
-                Text("正在准备路径...")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(Color.orange)
-            }
+
+            Text(manager.engineState.badgeText)
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .monospacedDigit()
+                .foregroundStyle(tint)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 3)
-        .background(Capsule().fill(Color.orange.opacity(0.14)))
+        .background(
+            Capsule()
+                .fill(tint.opacity(0.13))
+        )
     }
+
+    // MARK: - 实时日志控制台
 
     private var liveLogCard: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -776,14 +902,29 @@ public struct PortalMainView: View {
                         .font(.system(size: 13, weight: .bold))
                         .foregroundStyle(primaryText)
 
-                    if manager.isListening {
+                    if manager.engineState != .disabled {
                         statusBadgeView
                     }
                 }
 
                 Spacer()
 
-                HStack(spacing: 8) {
+                HStack(spacing: 10) {
+                    Button {
+                        manager.openDebugLogFile()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "doc.text.magnifyingglass")
+                                .font(.system(size: 11))
+                            Text("定位日志文件")
+                                .font(.system(size: 11))
+                        }
+                        .foregroundStyle(manager.debugModeEnabled ? Color.orange : secondaryText)
+                    }
+                    .buttonStyle(.plain)
+                    .pointingHandCursor()
+                    .help("在访达中定位 ~/Library/Logs/Portal-High-Bitrate/psportal.log")
+
                     Button {
                         manager.copyLogs()
                     } label: {
@@ -814,8 +955,32 @@ public struct PortalMainView: View {
                 }
             }
 
-            ScrollViewReader { proxy in
-                ScrollView(.vertical) {
+            portalLogConsole
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(Color.black.opacity(colorScheme == .dark ? 0.45 : 0.85))
+                        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(cardBorder, lineWidth: 0.8))
+                )
+        }
+        .padding(16)
+        .frame(maxHeight: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(cardFill)
+                .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(cardBorder, lineWidth: 0.8))
+        )
+    }
+
+    private var portalLogConsole: some View {
+        let activeBurstId = manager.logs.last(where: { $0.text.hasPrefix("[指引] 🎮 已检测到 Portal 唤醒并开启增强通道") })?.id
+        let activeReadyId = manager.logs.last(where: {
+            $0.text.hasPrefix("[就绪] 🎮 增强通道已就绪") || $0.text.hasPrefix("[准备] ⚡️ 网络协商就绪")
+        })?.id
+        let activeCooldownId = manager.logs.last(where: { $0.text.hasPrefix("[守望] ⏸ 本轮 120 秒窗口内暂未收到连接握手") })?.id
+
+        return ScrollViewReader { proxy in
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 0) {
                     VStack(alignment: .leading, spacing: 4) {
                         if manager.logs.isEmpty {
                             Text("等待插件执行，日志输出将实时显示于此...")
@@ -823,63 +988,101 @@ public struct PortalMainView: View {
                                 .foregroundStyle(Color.white.opacity(0.55))
                                 .padding(.vertical, 8)
                         } else {
-                            let activeReadyId = manager.logs.last(where: { $0.text.hasPrefix("[准备] ⚡️ 网络协商就绪") })?.id
                             ForEach(manager.logs) { entry in
-                                let displayLine: String = {
-                                    if manager.isListening,
-                                       entry.id == activeReadyId,
-                                       let remaining = manager.listenRemainingSeconds {
-                                        return "[准备] ⚡️ 网络协商就绪！请在 \(remaining) 秒内在 PS Portal 上点击连接 PS5..."
-                                    }
-                                    return entry.text
-                                }()
+                                let displayLine = portalLogDisplayLine(
+                                    for: entry,
+                                    activeBurstId: activeBurstId,
+                                    activeReadyId: activeReadyId,
+                                    activeCooldownId: activeCooldownId
+                                )
                                 Text(displayLine)
                                     .font(.system(size: 12, design: .monospaced))
                                     .monospacedDigit()
                                     .foregroundStyle(logColor(for: displayLine))
                                     .textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
                                     .id(entry.id)
                             }
                         }
                         Spacer(minLength: 0)
                     }
-                    .padding(10)
-                    .frame(maxWidth: .infinity, minHeight: 180, alignment: .topLeading)
+                    .padding([.horizontal, .top], 10)
+                    .padding(.bottom, 9)
+                    .frame(maxWidth: .infinity, minHeight: 179, alignment: .topLeading)
+
+                    Color.clear
+                        .frame(height: 1)
+                        .id("portal_log_bottom")
                 }
-                .onChange(of: manager.logs.last?.id) { lastId in
-                    if let lastId {
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            proxy.scrollTo(lastId, anchor: .bottom)
-                        }
+                .background(
+                    GeometryReader { contentGeo in
+                        Color.clear
+                            .preference(key: LogContentHeightPreferenceKey.self, value: contentGeo.size.height)
                     }
+                )
+            }
+            .onPreferenceChange(LogContentHeightPreferenceKey.self) { _ in
+                guard !manager.logs.isEmpty,
+                      Date().timeIntervalSince(manager.lastLogAppendAt) < 0.6 else { return }
+                proxy.scrollTo("portal_log_bottom", anchor: .bottom)
+            }
+            .onAppear {
+                guard !manager.logs.isEmpty else { return }
+                DispatchQueue.main.async {
+                    proxy.scrollTo("portal_log_bottom", anchor: .bottom)
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                    proxy.scrollTo("portal_log_bottom", anchor: .bottom)
                 }
             }
-            .background(
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(Color.black.opacity(colorScheme == .dark ? 0.45 : 0.86))
-                    .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(cardBorder, lineWidth: 0.8))
-            )
+            .onChange(of: manager.logs.last?.id) { lastId in
+                guard lastId != nil else { return }
+                DispatchQueue.main.async {
+                    proxy.scrollTo("portal_log_bottom", anchor: .bottom)
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+                    proxy.scrollTo("portal_log_bottom", anchor: .bottom)
+                }
+            }
         }
-        .padding(16)
-        .frame(maxHeight: .infinity)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(cardFill)
-                .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(cardBorder, lineWidth: 0.8))
-        )
+    }
+
+    private func portalLogDisplayLine(
+        for entry: PortalLogEntry,
+        activeBurstId: UUID?,
+        activeReadyId: UUID?,
+        activeCooldownId: UUID?
+    ) -> String {
+        if manager.isListening, let remaining = manager.listenRemainingSeconds {
+            if entry.id == activeBurstId {
+                return "[指引] 🎮 已检测到 Portal 唤醒并开启增强通道！请在 \(remaining) 秒内于 Portal 上点击「连接 PS5」。"
+            }
+            if entry.id == activeReadyId {
+                return "[就绪] 🎮 增强通道已就绪！现在请在 \(remaining) 秒内于 PS Portal 上点击连接 PS5。"
+            }
+        }
+        if let cooldown = manager.cooldownRemainingSeconds,
+           cooldown > 0,
+           entry.id == activeCooldownId {
+            return "[守望] ⏸ 本轮 120 秒窗口内暂未收到连接握手，已恢复直连路由。请等待 \(cooldown) 秒冷却结束后再用 Portal 连接。"
+        }
+        return entry.text
     }
 
     private func logColor(for line: String) -> Color {
-        if line.contains("[成功]") || line.contains("[ACCEPTED]") || line.contains("[ACTIVE]") || line.contains("[SUCCESS]") || line.contains("🎉") || line.contains("✅") || line.contains("Quality Confirmed") {
+        if line.contains("[DEBUG") {
+            return Color.orange.opacity(0.92)
+        }
+        if line.contains("[成功]") || line.contains("[就绪]") || line.contains("[ACCEPTED]") || line.contains("[ACTIVE]") || line.contains("[SUCCESS]") || line.contains("🎉") || line.contains("✅") || line.contains("Quality Confirmed") {
             return Color.green
         }
         if line.contains("[注入]") || line.contains("[响应]") || line.contains("[路由]") || line.contains("[识别]") || line.contains("[说明]") || line.contains("[PATCH]") || line.contains("[FORWARD]") || line.contains("🚀") || line.contains("🎯") {
             return Color.cyan
         }
-        if line.contains("[警告]") || line.contains("[准备]") || line.contains("[诊断]") || line.contains("[提示]") || line.contains("[更新]") || line.contains("[WARNING]") || line.contains("[WAITING]") || line.contains("⚡️") || line.contains("⚠️") || line.contains("💡") {
+        if line.contains("[警告]") || line.contains("[准备]") || line.contains("[指引]") || line.contains("[诊断]") || line.contains("[提示]") || line.contains("[更新]") || line.contains("[WARNING]") || line.contains("[WAITING]") || line.contains("⚡️") || line.contains("⚠️") || line.contains("💡") {
             return Color.yellow
         }
-        if line.contains("[错误]") || line.contains("[失败]") || line.contains("[ERROR]") || line.contains("❌") || line.contains("UNCONFIRMED") || line.contains("NOT APPLIED") {
+        if line.contains("[错误]") || line.contains("[失败]") || line.contains("[ERROR]") || line.contains("❌") || line.contains("Traceback") || line.contains("Error") || line.contains("UNCONFIRMED") || line.contains("NOT APPLIED") {
             return Color.red
         }
         return Color.white.opacity(0.92)
